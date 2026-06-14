@@ -205,9 +205,34 @@ def encode_block(zz_coeffs, prev_dc, kp_dc, kp_run, kp_lvl):
     return symbols, current_dc, kp_dc, kp_run, kp_lvl
 
 
-# ── Special test cases ────────────────────────────────────────────────────────
+# ── Compression rate ──────────────────────────────────────────────────────────
+def block_compression_rate(symbols, bit_depth=10):
+    """
+    Compute compression statistics for one encoded block.
+
+    Returns a dict with:
+      raw_bits     — bits needed to store the original 8x8 block uncompressed
+      coded_bits   — actual bits used by the h(v) codewords (incl. sign bits)
+      ratio        — raw_bits / coded_bits  (>1 means compression achieved)
+      bpp          — coded bits per pixel (coded_bits / 64)
+      zeros        — count of LEVEL symbols that are zero (always 0, kept for clarity)
+      num_symbols  — total symbols (DC + RUN + LEVEL + EOB)
+    """
+    raw_bits   = 64 * bit_depth                  # uncompressed size of 8x8 block
+    coded_bits = sum(len(cw) for _, _, _, _, cw in symbols)
+
+    ratio = raw_bits / coded_bits if coded_bits > 0 else float('inf')
+    bpp   = coded_bits / 64.0
+
+    return {
+        "raw_bits":    raw_bits,
+        "coded_bits":  coded_bits,
+        "ratio":       ratio,
+        "bpp":         bpp,
+        "num_symbols": len(symbols),
+    }
 def special_cases():
-    MAX = 2047; MIN = -2048
+    MAX = 511; MIN = -512
     cases = []
     cases.append([MAX]*8)
     cases.append([MIN]*8)
@@ -242,6 +267,10 @@ def write_1d_as_8rows(f, flat, fmt):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows",      type=int,  default=100)
+    parser.add_argument("--smooth",    action="store_true",
+                        help="Generate smooth (image-like) blocks instead of pure random")
+    parser.add_argument("--smooth_var",type=int,  default=8,
+                        help="Pixel variation around DC for smooth blocks (default 8)")
     parser.add_argument("--seed",      type=int,  default=None)
     parser.add_argument("--qp",        type=int,  default=22)
     parser.add_argument("--bit_depth", type=int,  default=10)
@@ -251,6 +280,7 @@ def main():
     parser.add_argument("--zzout_file",default="zigzag_output.txt")
     parser.add_argument("--enc_file",  default="encoded_output.txt")
     parser.add_argument("--bits_file", default="bitstream_input.txt")
+    parser.add_argument("--stats_file",default="compression_stats.txt")
     parser.add_argument("--pad",       action="store_true", default=True,
                         help="Pad last 32-bit word with zeros (default True)")
     args = parser.parse_args()
@@ -259,11 +289,26 @@ def main():
     actual_seed = args.seed if args.seed is not None else rng.randint(0, 2**32)
     rng         = random.Random(actual_seed)
 
-    MIN12 = -2048; MAX12 = 2047
+    MIN10 = -512; MAX10 = 511
 
     # Generate rows
-    random_rows = [[rng.randint(MIN12, MAX12) for _ in range(8)]
-                   for _ in range(args.rows)]
+    if args.smooth:
+        # Image-like data: each 8x8 block has a slowly varying base level
+        # with small random variation — concentrates energy in low frequencies
+        random_rows = []
+        block_base  = rng.randint(MIN10//2, MAX10//2)
+        for i in range(args.rows):
+            if i % 8 == 0:
+                # New block: drift the base level slightly
+                block_base += rng.randint(-20, 20)
+                block_base  = max(MIN10, min(MAX10, block_base))
+            row = [max(MIN10, min(MAX10,
+                       block_base + rng.randint(-args.smooth_var, args.smooth_var)))
+                   for _ in range(8)]
+            random_rows.append(row)
+    else:
+        random_rows = [[rng.randint(MIN10, MAX10) for _ in range(8)]
+                       for _ in range(args.rows)]
     all_rows = random_rows + special_cases()
     total    = len(all_rows)
 
@@ -278,7 +323,8 @@ def main():
     f_zz   = open(args.zzout_file, "w")
     f_enc  = open(args.enc_file,   "w")
 
-    bitstream = ""   # accumulate all codeword bits here
+    bitstream   = ""   # accumulate all codeword bits here
+    block_stats = []   # per-block compression stats
 
     prev_dc = 0   # DC predictor resets at tile start
     kp_dc   = 3   # initial kParam_DC  (RFC 9924: clip(0,5, 20>>1) → use 3)
@@ -315,6 +361,10 @@ def main():
             bitstream += codeword       # accumulate bits
         f_enc.write("\n")
 
+        # ── Compression stats for this block ─────────────────────────────────
+        stats = block_compression_rate(symbols, args.bit_depth)
+        block_stats.append(stats)
+
         # kParam_run and kParam_lvl reset at each block start
         kp_run = 0
         kp_lvl = 0
@@ -337,6 +387,21 @@ def main():
         for i in range(0, len(bitstream), 32):
             f.write(bitstream[i:i+32] + "\n")
 
+    # ── Write compression stats file ──────────────────────────────────────────
+    with open(args.stats_file, "w") as f:
+        f.write(f"{'Block':>6} {'RawBits':>8} {'CodedBits':>10} "
+                f"{'Ratio':>8} {'BPP':>6} {'Symbols':>8}\n")
+        for b, s in enumerate(block_stats):
+            f.write(f"{b:6d} {s['raw_bits']:8d} {s['coded_bits']:10d} "
+                    f"{s['ratio']:8.3f} {s['bpp']:6.3f} {s['num_symbols']:8d}\n")
+
+        total_raw   = sum(s['raw_bits']   for s in block_stats)
+        total_coded = sum(s['coded_bits'] for s in block_stats)
+        f.write(f"\n{'TOTAL':>6} {total_raw:8d} {total_coded:10d} "
+                f"{total_raw/total_coded:8.3f} "
+                f"{total_coded/(64*len(block_stats)):6.3f} "
+                f"{sum(s['num_symbols'] for s in block_stats):8d}\n")
+
     # ── Print summary ─────────────────────────────────────────────────────────
     print(f"Seed:      {actual_seed}")
     print(f"Blocks:    {num_blocks}  ({args.rows} random rows → {num_blocks} 8x8 blocks)")
@@ -351,7 +416,7 @@ def main():
     print(f"  CODEWORD: h(v) binary codeword (magnitude + sign bit if applicable)")
     print()
     for fn in [args.in_file, args.fdct_file, args.qout_file,
-               args.zzout_file, args.enc_file, args.bits_file]:
+               args.zzout_file, args.enc_file, args.bits_file, args.stats_file]:
         print(f"  {fn:<25} {os.path.getsize(fn):>8,} bytes")
 
     words     = len(bitstream) // 32
@@ -361,6 +426,19 @@ def main():
     print(f"  32-bit words: {words}")
     print(f"  Padding:      {last_pad} zero bits added to last word"
           if last_pad else "  Last word:   exact 32-bit boundary, no padding")
+    print()
+    print(f"Compression summary:")
+    total_raw   = sum(s['raw_bits']   for s in block_stats)
+    total_coded = sum(s['coded_bits'] for s in block_stats)
+    print(f"  Total raw bits:    {total_raw}  ({total_raw//8} bytes)")
+    print(f"  Total coded bits:  {total_coded}  ({total_coded//8} bytes)")
+    print(f"  Overall ratio:     {total_raw/total_coded:.3f}x")
+    print(f"  Avg bits/pixel:    {total_coded/(64*len(block_stats)):.3f}  "
+          f"(raw = {args.bit_depth}.000)")
+    print()
+    print(f"  Per-block ratio range: "
+          f"{min(s['ratio'] for s in block_stats):.3f}x "
+          f"to {max(s['ratio'] for s in block_stats):.3f}x")
 
 
 if __name__ == "__main__":
