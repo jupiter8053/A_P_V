@@ -44,14 +44,32 @@ QM_FLAT     = [[16]*8 for _ in range(8)]
 
 
 # ── FDCT ─────────────────────────────────────────────────────────────────────
-def fdct_1d(x):
-    return [(sum(T[k][n]*x[n] for n in range(8)) + 64) >> 7 for k in range(8)]
+def fdct_shift1(bit_depth): return bit_depth - 6   # row pass: 4 for 10-bit
+def fdct_shift2():          return 9               # column pass: constant
 
-def fdct_2d(block):
-    def tr(b): return [[b[r][c] for r in range(8)] for c in range(8)]
-    rp = [fdct_1d(block[r]) for r in range(8)]
-    cp = [fdct_1d(tr(rp)[r]) for r in range(8)]
-    return cp
+def fdct_1d(x, shift):
+    """8-point FDCT butterfly pass with correct per-pass shift (RFC 9924)."""
+    e = [x[k] + x[7-k] for k in range(4)]
+    o = [x[k] - x[7-k] for k in range(4)]
+    ee0, eo0 = e[0]+e[3], e[0]-e[3]
+    ee1, eo1 = e[1]+e[2], e[1]-e[2]
+    add = 1 << (shift-1)
+    out = [0]*8
+    out[0] = (T[0][0]*ee0 + T[0][1]*ee1 + add) >> shift
+    out[4] = (T[4][0]*ee0 + T[4][1]*ee1 + add) >> shift
+    out[2] = (T[2][0]*eo0 + T[2][1]*eo1 + add) >> shift
+    out[6] = (T[6][0]*eo0 + T[6][1]*eo1 + add) >> shift
+    for row in (1, 3, 5, 7):
+        out[row] = (sum(T[row][m]*o[m] for m in range(4)) + add) >> shift
+    return out
+
+def fdct_2d(block, bit_depth=10):
+    """Full 8x8 2D FDCT. Returns result in hardware-natural order (no final
+    transpose): result[c] is the column-pass output for column c."""
+    s1, s2 = fdct_shift1(bit_depth), fdct_shift2()
+    row_out = [fdct_1d(block[r], s1) for r in range(8)]
+    cols    = [[row_out[r][c] for r in range(8)] for c in range(8)]
+    return  [fdct_1d(cols[c], s2) for c in range(8)]
 
 
 # ── Quantisation (RFC 9924 §6.3.3) ──────────────────────────────────────────
@@ -196,11 +214,13 @@ def encode_block(zz_coeffs, prev_dc, kp_dc, kp_run, kp_lvl):
             kp_lvl = clip_kp(abs_lvl, 2, 4)
             run    = 0
 
-    # EOB
+    # EOB — trailing zeros from last nonzero to end of block
     if last_nonzero < 63:
-        eob_run = 63 - last_nonzero + run if last_nonzero >= 0 else 63
+        # 'run' already holds the exact trailing-zero count accumulated since
+        # the last nonzero coefficient; no further arithmetic needed.
+        eob_run = run if last_nonzero >= 0 else 63
         cw_eob  = encode_hv(eob_run, kp_run)
-        symbols.append((EOB, 0, 0, kp_run, cw_eob))
+        symbols.append((EOB, eob_run, 0, kp_run, cw_eob))
 
     return symbols, current_dc, kp_dc, kp_run, kp_lvl
 
@@ -327,7 +347,7 @@ def main():
     block_stats = []   # per-block compression stats
 
     prev_dc = 0   # DC predictor resets at tile start
-    kp_dc   = 3   # initial kParam_DC  (RFC 9924: clip(0,5, 20>>1) → use 3)
+    kp_dc   = 0   # initial kParam_DC: clip(0, 5, PrevDcDiff>>1) with PrevDcDiff=0 → 0
     kp_run  = 0   # initial kParam_run
     kp_lvl  = 0   # initial kParam_lvl
 
@@ -340,7 +360,7 @@ def main():
         f_in.write("\n")
 
         # ── FDCT ──────────────────────────────────────────────────────────────
-        dct_block = fdct_2d(block)
+        dct_block = fdct_2d(block, args.bit_depth)
         write_8x8(f_fdct, dct_block, lambda v: f"{v:7d}")
 
         # ── Quantise ──────────────────────────────────────────────────────────
