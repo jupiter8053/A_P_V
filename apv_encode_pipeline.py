@@ -376,8 +376,9 @@ def main():
             zz, prev_dc, kp_dc, kp_run, kp_lvl)
 
         for sym_type, value, sign, kparam, codeword in symbols:
-            f_enc.write(f"{sym_type:2d}  {value:6d}  {sign:1d}  "
-                        f"{kparam:1d}  {codeword}\n")
+            signed_val = -value if sign == 1 else value
+            f_enc.write(f"{sym_type:2d}  {value:6d}  {sign:1d}  {signed_val:7d}  "
+                        f"{kparam:1d}  {len(codeword):2d}  {codeword}\n")
             bitstream += codeword       # accumulate bits
         f_enc.write("\n")
 
@@ -429,7 +430,7 @@ def main():
     print()
     type_names = {DC:"DC", RUN:"RUN", LEVEL:"LVL", EOB:"EOB"}
     print(f"encoded_output.txt format:")
-    print(f"  TYPE  VALUE  SIGN  KPARAM  CODEWORD")
+    print(f"  TYPE  VALUE  SIGN  SIGNED_VALUE  KPARAM  CW_LEN  CODEWORD")
     print(f"  0=DC_DIFF  1=RUN  2=LEVEL  3=EOB")
     print(f"  SIGN:    0=positive  1=negative  (always 0 for RUN and EOB)")
     print(f"  KPARAM:  kParam used to encode this symbol")
