@@ -26,7 +26,7 @@ import argparse
 import os
 import random
 
-# ── APV transform matrix T (RFC 9924 §6.3.2.3) ──────────────────────────────
+# -- APV transform matrix T (RFC 9924 §6.3.2.3) ------------------------------
 T = [
     [ 64,  64,  64,  64,  64,  64,  64,  64],
     [ 89,  75,  50,  18, -18, -50, -75, -89],
@@ -38,12 +38,12 @@ T = [
     [ 18, -50,  75, -89,  89, -75,  50, -18],
 ]
 
-# ── APV level scale table (RFC 9924 §6.3.3) ─────────────────────────────────
+# -- APV level scale table (RFC 9924 §6.3.3) ---------------------------------
 LEVEL_SCALE = [40, 45, 51, 57, 64, 72]
 QM_FLAT     = [[16]*8 for _ in range(8)]
 
 
-# ── FDCT ─────────────────────────────────────────────────────────────────────
+# -- FDCT ---------------------------------------------------------------------
 def fdct_shift1(bit_depth): return bit_depth - 6   # row pass: 4 for 10-bit
 def fdct_shift2():          return 9               # column pass: constant
 
@@ -72,7 +72,7 @@ def fdct_2d(block, bit_depth=10):
     return  [fdct_1d(cols[c], s2) for c in range(8)]
 
 
-# ── Quantisation (RFC 9924 §6.3.3) ──────────────────────────────────────────
+# -- Quantisation (RFC 9924 §6.3.3) ------------------------------------------
 def quantise(block, qp, bit_depth=10, qm=None):
     if qm is None: qm = QM_FLAT
     scale   = LEVEL_SCALE[qp % 6]
@@ -94,7 +94,7 @@ def quantise(block, qp, bit_depth=10, qm=None):
     return result
 
 
-# ── Zigzag scan ───────────────────────────────────────────────────────────────
+# -- Zigzag scan ---------------------------------------------------------------
 def _gen_zigzag():
     scan = []
     for d in range(15):
@@ -115,7 +115,7 @@ def zigzag_scan(block):
     return [flat[i] for i in SCAN]
 
 
-# ── APV h(v) VLC encoder (RFC 9924 §6.4.3) ───────────────────────────────────
+# -- APV h(v) VLC encoder (RFC 9924 §6.4.3) -----------------------------------
 def encode_hv(value, kParam):
     """
     Encode a non-negative integer using the APV h(v) variable length code.
@@ -162,16 +162,16 @@ RUN   = 1
 LEVEL = 2
 EOB   = 3
 
-def encode_block(zz_coeffs, prev_dc, kp_dc, kp_run, kp_lvl):
+def encode_block(zz_coeffs, prev_dc, kp_dc, kp_run, kp_ac):
     """
     Encode one zigzag-ordered 64-element coefficient list.
     Returns list of (type, value, sign, kparam, codeword) tuples
-    and updated (prev_dc, kp_dc, kp_run, kp_lvl).
+    and updated (prev_dc, kp_dc, kp_run, kp_ac).
 
     TYPE  VALUE                       SIGN  KPARAM  CODEWORD
     DC    abs(current_dc - prev_dc)   0/1   kp_dc   magnitude + sign bits
     RUN   zero count before level     0     kp_run  magnitude bits
-    LVL   abs(coeff) - 1              0/1   kp_lvl  magnitude + sign bits
+    LVL   abs(coeff) - 1              0/1   kp_ac  magnitude + sign bits
     EOB   0                           0     kp_run  magnitude bits
     """
     symbols = []
@@ -179,13 +179,13 @@ def encode_block(zz_coeffs, prev_dc, kp_dc, kp_run, kp_lvl):
     # DC coefficient
     current_dc = zz_coeffs[0]
     dc_diff    = current_dc - prev_dc
-    abs_dc     = abs(dc_diff)
-    sign_dc    = 1 if dc_diff < 0 else 0
-    cw_dc      = encode_hv(abs_dc, kp_dc)
-    if abs_dc != 0:
-        cw_dc += str(sign_dc)           # sign bit appended after magnitude
-    symbols.append((DC, abs_dc, sign_dc, kp_dc, cw_dc))
-    kp_dc = clip_kp(abs_dc, 1, 5)      # update kParam_DC
+    abs_dc_coeff_diff     = abs(dc_diff)
+    sign_dc_coeff_diff    = 1 if dc_diff < 0 else 0
+    cw_dc_diff      = encode_hv(abs_dc_coeff_diff, kp_dc)
+    if abs_dc_coeff_diff != 0:
+        cw_dc_diff += str(sign_dc_coeff_diff)           # sign bit appended after magnitude
+    symbols.append((DC, abs_dc_coeff_diff, sign_dc_coeff_diff, kp_dc, cw_dc_diff))
+    kp_dc = clip_kp(abs_dc_coeff_diff, 1, 5)      # update kParam_DC
 
     # AC coefficients
     run          = 0
@@ -204,14 +204,14 @@ def encode_block(zz_coeffs, prev_dc, kp_dc, kp_run, kp_lvl):
             symbols.append((RUN, run, 0, kp_run, cw_run))
             kp_run = clip_kp(run, 2, 2)
 
-            # LEVEL symbol  (abs_ac_coeff_minus1)
-            abs_lvl = abs(coeff) - 1
-            sign_lv = 1 if coeff < 0 else 0
-            cw_lvl  = encode_hv(abs_lvl, kp_lvl)
-            if abs_lvl + 1 != 0:        # always true since coeff != 0
-                cw_lvl += str(sign_lv)  # sign bit
-            symbols.append((LEVEL, abs_lvl, sign_lv, kp_lvl, cw_lvl))
-            kp_lvl = clip_kp(abs_lvl, 2, 4)
+            # LEVEL symbol  (abs_ac_coeff_minus1 per RFC 9924)
+            abs_coeff      = abs(coeff)           # actual magnitude
+            abs_ac_coeff_min1 = abs_coeff - 1    # bitstream value (min 0)
+            sign_ac           = 1 if coeff < 0 else 0
+            cw_ac             = encode_hv(abs_ac_coeff_min1, kp_ac)
+            cw_ac            += str(sign_ac)         # sign bit always present for non-zero AC
+            symbols.append((LEVEL, abs_ac_coeff_min1, sign_ac, kp_ac, cw_ac))
+            kp_ac = clip_kp(abs_ac_coeff_min1, 2, 4)
             run    = 0
 
     # EOB — trailing zeros from last nonzero to end of block
@@ -222,10 +222,10 @@ def encode_block(zz_coeffs, prev_dc, kp_dc, kp_run, kp_lvl):
         cw_eob  = encode_hv(eob_run, kp_run)
         symbols.append((EOB, eob_run, 0, kp_run, cw_eob))
 
-    return symbols, current_dc, kp_dc, kp_run, kp_lvl
+    return symbols, current_dc, kp_dc, kp_run, kp_ac
 
 
-# ── Compression rate ──────────────────────────────────────────────────────────
+# -- Compression rate ----------------------------------------------------------
 def block_compression_rate(symbols, bit_depth=10):
     """
     Compute compression statistics for one encoded block.
@@ -269,7 +269,7 @@ def special_cases():
     return cases
 
 
-# ── Write helpers ─────────────────────────────────────────────────────────────
+# -- Write helpers -------------------------------------------------------------
 def write_8x8(f, block, fmt):
     """Write 8x8 block as 8 lines of 8 values, then blank line."""
     for row in block:
@@ -283,7 +283,7 @@ def write_1d_as_8rows(f, flat, fmt):
     f.write("\n")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# -- Main ----------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows",      type=int,  default=100)
@@ -336,7 +336,7 @@ def main():
     num_blocks = total // 8
     blocks     = [all_rows[b*8:(b+1)*8] for b in range(num_blocks)]
 
-    # ── Open all output files ─────────────────────────────────────────────────
+    # -- Open all output files -------------------------------------------------
     f_in   = open(args.in_file,    "w")
     f_fdct = open(args.fdct_file,  "w")
     f_qout = open(args.qout_file,  "w")
@@ -349,52 +349,55 @@ def main():
     prev_dc = 0   # DC predictor resets at tile start
     kp_dc   = 0   # initial kParam_DC: clip(0, 5, PrevDcDiff>>1) with PrevDcDiff=0 → 0
     kp_run  = 0   # initial kParam_run
-    kp_lvl  = 0   # initial kParam_lvl
+    kp_ac  = 0   # initial kParam_lvl
 
     for b, block in enumerate(blocks):
 
-        # ── Write input (4 samples per line) ─────────────────────────────────
+        # -- Write input (4 samples per line) ---------------------------------
         for row in block:
             f_in.write(" ".join(f"{v:6d}" for v in row[:4]) + "\n")
             f_in.write(" ".join(f"{v:6d}" for v in row[4:]) + "\n")
         f_in.write("\n")
 
-        # ── FDCT ──────────────────────────────────────────────────────────────
+        # -- FDCT --------------------------------------------------------------
         dct_block = fdct_2d(block, args.bit_depth)
         write_8x8(f_fdct, dct_block, lambda v: f"{v:7d}")
 
-        # ── Quantise ──────────────────────────────────────────────────────────
+        # -- Quantise ----------------------------------------------------------
         q_block = quantise(dct_block, args.qp, args.bit_depth)
         write_8x8(f_qout, q_block, lambda v: f"{v:6d}")
 
-        # ── Zigzag scan ───────────────────────────────────────────────────────
+        # -- Zigzag scan -------------------------------------------------------
         zz = zigzag_scan(q_block)
         write_1d_as_8rows(f_zz, zz, lambda v: f"{v:6d}")
 
-        # ── Run-level encode with codewords ───────────────────────────────────
-        symbols, prev_dc, kp_dc, kp_run, kp_lvl = encode_block(
-            zz, prev_dc, kp_dc, kp_run, kp_lvl)
+        # -- Run-level encode with codewords -----------------------------------
+        symbols, prev_dc, kp_dc, kp_run, kp_ac = encode_block(zz, prev_dc, kp_dc, kp_run, kp_ac)
 
         for sym_type, value, sign, kparam, codeword in symbols:
-            signed_val = -value if sign == 1 else value
-            f_enc.write(f"{sym_type:2d}  {value:6d}  {sign:1d}  {signed_val:7d}  "
+            # For LEVEL symbols, value = abs(coeff)-1, so restore actual coeff for display
+            if sym_type == LEVEL:
+                actual = (value + 1) * (-1 if sign == 1 else 1)
+            else:
+                actual = -value if sign == 1 else value
+            f_enc.write(f"{sym_type:2d}  {value:6d}  {sign:1d}  {actual:7d}  "
                         f"{kparam:1d}  {len(codeword):2d}  {codeword}\n")
             bitstream += codeword       # accumulate bits
         f_enc.write("\n")
 
-        # ── Compression stats for this block ─────────────────────────────────
+        # -- Compression stats for this block ---------------------------------
         stats = block_compression_rate(symbols, args.bit_depth)
         block_stats.append(stats)
 
         # kParam_run and kParam_lvl reset at each block start
         kp_run = 0
-        kp_lvl = 0
+        kp_ac = 0
 
     # Close all files
     for f in [f_in, f_fdct, f_qout, f_zz, f_enc]:
         f.close()
 
-    # ── Write bitstream file — 32 bits per line ───────────────────────────────
+    # -- Write bitstream file — 32 bits per line -------------------------------
     total_bits = len(bitstream)
     remainder  = total_bits % 32
 
@@ -408,7 +411,7 @@ def main():
         for i in range(0, len(bitstream), 32):
             f.write(bitstream[i:i+32] + "\n")
 
-    # ── Write compression stats file ──────────────────────────────────────────
+    # -- Write compression stats file ------------------------------------------
     with open(args.stats_file, "w") as f:
         f.write(f"{'Block':>6} {'RawBits':>8} {'CodedBits':>10} "
                 f"{'Ratio':>8} {'BPP':>6} {'Symbols':>8}\n")
@@ -423,7 +426,7 @@ def main():
                 f"{total_coded/(64*len(block_stats)):6.3f} "
                 f"{sum(s['num_symbols'] for s in block_stats):8d}\n")
 
-    # ── Print summary ─────────────────────────────────────────────────────────
+    # -- Print summary ---------------------------------------------------------
     print(f"Seed:      {actual_seed}")
     print(f"Blocks:    {num_blocks}  ({args.rows} random rows → {num_blocks} 8x8 blocks)")
     print(f"qP:        {args.qp}  bit_depth={args.bit_depth}")
