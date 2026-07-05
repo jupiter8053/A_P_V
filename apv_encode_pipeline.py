@@ -886,21 +886,41 @@ def get_achievable_coeff_bounds(bit_depth=10, qp=0):
     dc_max = quantise(dct_max, qp=qp, bit_depth=bit_depth)[0][0]
     dc_min = quantise(dct_min, qp=qp, bit_depth=bit_depth)[0][0]
 
-    # Search several high-frequency-concentrating patterns for the
-    # worst-case AC coefficient magnitude at this bit depth
-    patterns = [
-        [[MAX_V if (r+c) % 2 == 0 else MIN_V for c in range(8)] for r in range(8)],
-        [[MAX_V if c % 2 == 0 else MIN_V for c in range(8)] for r in range(8)],
-        [[MAX_V if r % 2 == 0 else MIN_V for c in range(8)] for r in range(8)],
-        [[MAX_V if r == c else MIN_V for c in range(8)] for r in range(8)],
-    ]
+    # Search ALL 63 non-DC 2D DCT basis frequencies for the true worst-case
+    # AC coefficient magnitude. A pixel block built as the scaled DCT basis
+    # function for frequency (u,v) concentrates energy specifically into
+    # coefficient (u,v), so testing all 63 basis frequencies (rather than a
+    # handful of guessed visual patterns like checkerboard/stripes, which do
+    # NOT reliably find the true maximum) is the correct exhaustive search.
+    import math as _math
+
+    def _dct_basis_pixel_block(u, v):
+        block = [[0.0] * 8 for _ in range(8)]
+        for x in range(8):
+            for y in range(8):
+                cu = 1 / _math.sqrt(2) if u == 0 else 1
+                cv = 1 / _math.sqrt(2) if v == 0 else 1
+                block[x][y] = (cu * cv
+                               * _math.cos((2*x+1) * u * _math.pi / 16)
+                               * _math.cos((2*y+1) * v * _math.pi / 16))
+        flat = [val for row in block for val in row]
+        peak = max(abs(min(flat)), abs(max(flat)))
+        scale = MAX_V / peak if peak > 0 else 1
+        pixel_block = [[max(MIN_V, min(MAX_V, int(round(block[x][y] * scale))))
+                        for y in range(8)] for x in range(8)]
+        return pixel_block
+
     ac_max_abs = 0
-    for pat in patterns:
-        dct_p = fdct_2d(pat, bit_depth=bit_depth)
-        q_p   = quantise(dct_p, qp=qp, bit_depth=bit_depth)
-        ac_vals = [q_p[r][c] for r in range(8) for c in range(8)
-                   if not (r == 0 and c == 0)]
-        ac_max_abs = max(ac_max_abs, max(abs(v) for v in ac_vals))
+    for u in range(8):
+        for v in range(8):
+            if u == 0 and v == 0:
+                continue   # skip DC frequency, only searching AC positions
+            pat = _dct_basis_pixel_block(u, v)
+            dct_p = fdct_2d(pat, bit_depth=bit_depth)
+            q_p   = quantise(dct_p, qp=qp, bit_depth=bit_depth)
+            ac_vals = [q_p[r][c] for r in range(8) for c in range(8)
+                       if not (r == 0 and c == 0)]
+            ac_max_abs = max(ac_max_abs, max(abs(val) for val in ac_vals))
 
     return {
         'bit_depth': bit_depth,
@@ -994,15 +1014,148 @@ def build_10bit_input_max_dc_diff_frame(qp=0):
 def block_max_run_before_level(coeff_value, run_length):
     """
     A block whose zigzag AC coefficients are all zero for run_length
-    positions, followed by one nonzero coefficient. run_length is
-    clamped so run_length + 1 does not exceed the 63 AC positions
-    available. coeff_value should be within the achievable range for
-    the caller's target bit depth (see get_achievable_coeff_bounds()).
+    positions, followed by one nonzero coefficient. run_length may be
+    0..63: at run_length=63, ALL 63 AC positions are zero (no LEVEL
+    symbol is produced at all -- this becomes a pure EOB(63) block,
+    which is the true boundary case at the o_run port's 6-bit ceiling
+    with NO trailing coefficient, distinct from run_length=62 which
+    still has a real coefficient at the very last position).
+    coeff_value should be within the achievable range for the
+    caller's target bit depth (see get_achievable_coeff_bounds());
+    it is ignored when run_length=63.
     """
     zz = [0] * 64
     zz[0] = 0
-    run_length = min(run_length, 62)
-    zz[1 + run_length] = coeff_value
+    run_length = min(run_length, 63)
+    if run_length < 63:
+        zz[1 + run_length] = coeff_value
+    # else: all 63 AC positions stay zero -> encode_block() emits EOB(63)
+    return zz
+
+
+def block_max_run_and_max_level(bit_depth=10, qp=0, run_length=62):
+    """
+    GAP 5: combine worst-case run length AND worst-case AC magnitude in
+    the SAME symbol -- block_max_run_before_level() and block_dense_ac()
+    each test these two pressures independently, but never together.
+    This places the single nonzero AC coefficient at run_length
+    positions in (default 62, the longest run that still has a
+    trailing coefficient), with its magnitude set to the bit-depth's
+    real achievable AC ceiling (via get_achievable_coeff_bounds()) --
+    the longest possible RUN codeword immediately followed by the
+    longest possible LEVEL codeword, back to back in one symbol pair.
+    """
+    bounds = get_achievable_coeff_bounds(bit_depth=bit_depth, qp=qp)
+    return block_max_run_before_level(
+        coeff_value=bounds['ac_max_abs'], run_length=run_length)
+
+
+def build_zero_dc_diff_stress_frame(bit_depth=10, qp=0):
+    """
+    Build a REAL bitstream stressing the zero-DC-diff, no-sign-bit case:
+    for each target diff in target_diffs, a "priming" block moves
+    prev_dc by that diff (establishing a kp_dc value per
+    clip_kp(abs_dc, rsh=1, hi=5) = min(5, abs_dc >> 1)), immediately
+    followed by a block with the IDENTICAL DC coefficient (diff=0).
+
+    Per encode_block()'s real behaviour, a diff=0 DC symbol omits the
+    sign bit entirely (cw_dc += str(sign_dc) only when abs_dc != 0), so
+    its codeword is PURE MAGNITUDE -- one bit shorter than a nonzero-
+    diff codeword at the same kParam. A decoder that always expects a
+    trailing sign bit after the DC magnitude field would silently
+    misalign the shifter by exactly 1 bit on every zero-diff DC symbol.
+
+    NOTE: when target_diff=0, the "priming" step is ALSO a zero-diff
+    DC symbol in its own right (its diff from the previous block is
+    exactly 0), so the returned info reports EVERY zero-diff DC symbol
+    that actually occurs in the bitstream -- both from priming steps
+    that happen to land on diff=0 AND from the deliberate same-DC
+    follow-up step -- rather than assuming a fixed count.
+
+    Returns (bitstream, lengths, symbols, info) where info contains
+    the achieved kParam values and confirms EVERY zero-diff codeword's
+    length matches the pure-magnitude expectation.
+    """
+    all_symbols = []
+    prev_dc = 0
+    kp_dc = 0
+
+    # clip_kp(abs_dc, rsh=1, hi=5) = min(5, abs_dc >> 1):
+    #   diff=0 -> kp=0   diff=3 -> kp=1   diff=5 -> kp=2
+    #   diff=7 -> kp=3   diff=9 -> kp=4   diff=20 -> kp=5 (saturated)
+    target_diffs = [0, 3, 5, 7, 9, 20]
+    bounds = get_achievable_coeff_bounds(bit_depth=bit_depth, qp=qp)
+    dc_min, dc_max = bounds['dc_min'], bounds['dc_max']
+
+    for target_diff in target_diffs:
+        new_dc = max(dc_min, min(dc_max, prev_dc + target_diff))
+
+        # Priming block: establishes prev_dc = new_dc. NOTE: when
+        # target_diff=0 this priming step is ITSELF a zero-diff DC
+        # symbol -- that is a real, legitimate occurrence, not an
+        # error, and is correctly counted below along with every
+        # other zero-diff DC symbol in the stream.
+        zz_prime = block_saturated_dc(new_dc)
+        symbols, prev_dc, kp_dc, _, _ = encode_block(zz_prime, prev_dc, kp_dc, 0, 0)
+        all_symbols.extend(symbols)
+
+        # Zero-diff block: SAME dc value again -> diff=0, at the kp_dc
+        # just established by the priming step above
+        zz_same = block_saturated_dc(prev_dc)
+        symbols2, prev_dc, kp_dc, _, _ = encode_block(zz_same, prev_dc, kp_dc, 0, 0)
+        all_symbols.extend(symbols2)
+
+    # Scan ALL symbols (priming AND follow-up alike) for every zero-diff
+    # DC occurrence, rather than assuming only the follow-up steps
+    # produce one -- this correctly captures the target_diff=0 case's
+    # priming step too.
+    zero_diff_kparams = []
+    zero_diff_codeword_lens = []
+    for sym_type, value, sign, kparam, codeword in all_symbols:
+        if sym_type == DC and value == 0:
+            zero_diff_kparams.append(kparam)
+            zero_diff_codeword_lens.append(len(codeword))
+
+    bitstream = ''.join(sym[4] for sym in all_symbols)
+    lengths   = [len(sym[4]) for sym in all_symbols]
+
+    info = {
+        'bit_depth': bit_depth,
+        'qp': qp,
+        'zero_diff_kparams': zero_diff_kparams,
+        'zero_diff_codeword_lens': zero_diff_codeword_lens,
+        'expected_codeword_lens': [len(encode_hv(0, kp)) for kp in zero_diff_kparams],
+    }
+
+    return bitstream, lengths, all_symbols, info
+
+
+def block_multi_extended_tier_stress(bit_depth=10, qp=0, num_extended=8):
+    """
+    GAP 2: multiple consecutive EXTENDED-tier codewords back-to-back
+    within a single block, stressing the shifter's ability to refill
+    mid-codeword across several long codewords in a row (as opposed to
+    block_single_extended_tier_ac(), which places only ONE such
+    codeword and surrounds it with zeros). Every num_extended-th AC
+    position (evenly spaced across the 63 AC positions) is set to the
+    bit-depth's achievable AC ceiling, guaranteeing an EXTENDED-tier
+    h(v) codeword at each of those positions -- with ordinary small
+    values in between so the codeword boundaries are distinguishable
+    from each other during decode.
+    """
+    bounds = get_achievable_coeff_bounds(bit_depth=bit_depth, qp=qp)
+    ac_ceiling = bounds['ac_max_abs']
+
+    zz = [0] * 64
+    zz[0] = 10   # unremarkable DC
+
+    stride = max(1, 63 // num_extended)
+    for pos in range(1, 64):
+        if (pos - 1) % stride == 0:
+            zz[pos] = ac_ceiling if (pos // stride) % 2 == 0 else -ac_ceiling
+        else:
+            zz[pos] = 3   # small ordinary value between EXTENDED-tier spikes
+
     return zz
 
 
@@ -1126,6 +1279,14 @@ def build_worst_case_frame(seed=0, filler_blocks_between=3, bit_depth=10, qp=0):
     blocks.append(random_block(rng, bit_depth=bit_depth))
     blocks.append(block_max_run_before_level(
         coeff_value=bounds['ac_max_abs'], run_length=62))
+    blocks.append(block_max_run_before_level(
+        coeff_value=bounds['ac_max_abs'], run_length=63))   # GAP 1: pure EOB(63)
+    blocks.append(random_block(rng, bit_depth=bit_depth))
+    blocks.append(block_max_run_and_max_level(
+        bit_depth=bit_depth, qp=qp, run_length=62))          # GAP 5
+    blocks.append(random_block(rng, bit_depth=bit_depth))
+    blocks.append(block_multi_extended_tier_stress(
+        bit_depth=bit_depth, qp=qp, num_extended=8))          # GAP 2
     blocks.append(random_block(rng, bit_depth=bit_depth))
     blocks.append(block_dense_ac(pattern='alternating',
                                   magnitude=min(45, bounds['ac_max_abs']),
