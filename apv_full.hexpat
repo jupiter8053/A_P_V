@@ -75,12 +75,12 @@ struct PbuBase {
     str ptype_str = "";
     /*
     syntax code                                                     | type
-    ----------------------------------------------------------------|-----
+    --------------------------------------------------------------|-----
     pbu_header(){                                                   |
         pbu_type                                                    | u(8)
         group_id                                                    | u(16)
         reserved_zero_8bits                                         | u(8)
-    }                                                               |
+    }                                                                |
     */
     u32 pbu_size; // originally, this syntax is part of AccessUnit
     u8  pbu_type;
@@ -91,7 +91,7 @@ struct PbuBase {
 
 /*
 syntax code                                                     | type
-----------------------------------------------------------------|-----
+--------------------------------------------------------------|-----
 frame_info(){                                                   |
     profile_idc                                                 | u(8)
     level_idc                                                   | u(8)
@@ -103,7 +103,7 @@ frame_info(){                                                   |
     bit_depth_minus8                                            | u(4)
     capture_time_distance                                       | u(8)
     reserved_zero_8bits                                         | u(8)
-}                                                               |
+}                                                                |
 */
 bitfield FrmInfo {
     profile_idc : 8;
@@ -240,44 +240,44 @@ bitfield FrmHeader {
 
 /*
 syntax code                                                     | type
-----------------------------------------------------------------|-----
-tile_header(tileIdx){                                           |
+--------------------------------------------------------------|-----
+tile_header(tileIdx){                                          |
     tile_header_size                                            | u(16)
     tile_index                                                  | u(16)
-    for(i = 0; i < NumComps; i++){                              |
+    for(i = 0; i < NumComps; i++){                               |
         tile_data_size[i]                                       | u(32)
-    }                                                           |
-    for(i = 0; i < NumComps; i++){                              |
+    }                                                            |
+    for(i = 0; i < NumComps; i++){                               |
         tile_qp[i]                                              | u(8)
-    }                                                           |
+    }                                                            |
     reserved_zero_8bits                                         | u(8)
     byte_alignment()                                            |
-}                                                               |
+}                                                                |
 */
-struct TileHeader(u32 num_comps) {
+u32 g_tile_count = 0;
+u32 g_num_comps  = 0;
+
+struct TileHeader {
     u16 tile_header_size;
     u16 tile_index;
-    u32 tile_data_size[num_comps];
-    u8  tile_qp[num_comps];
+    u32 tile_data_size[g_num_comps];
+    u8  tile_qp[g_num_comps];
     u8  reserved_zero_8bits;
     // already byte-aligned: no bitfield needed for this structure
 };
 
-u32 g_tile_count = 0;
-u32 g_num_comps  = 0;
-
 /*
 syntax code                                                     | type
-----------------------------------------------------------------|-----
+--------------------------------------------------------------|-----
 tile(tileIdx){                                                  |
     tile_header(tileIdx)                                        |
-    for(i = 0; i < NumComps; i++){                              |
+    for(i = 0; i < NumComps; i++){                               |
         tile_data(tileIdx, i)                                   |
-    }                                                           |
-    while(more_data_in_tile()){                                 |
+    }                                                            |
+    while(more_data_in_tile()){                                  |
         tile_dummy_byte                                         | b(8)
-    }                                                           |
-}                                                               |
+    }                                                            |
+}                                                                |
 
 Note: tile_size[i] (read just before this struct, in frame()) covers
 the whole tile(i): header + per-component data + dummy padding.
@@ -292,7 +292,7 @@ struct Tile {
     u32 tile_size;
     u64 tile_body_start = $;
 
-    TileHeader(num_comps) theader [[name("tile_header()")]];
+    TileHeader theader [[name("tile_header()")]];
 
     // Component index -> name mapping per RFC 9924:
     // chroma_format_idc 0 (400): 0=Y
