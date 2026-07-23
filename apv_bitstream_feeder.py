@@ -212,8 +212,11 @@ def parse_frame_info(br: BitReader) -> dict:
 # ---------------------------------------------------------------------------
 
 def skip_quantization_matrix(br: BitReader, num_comps: int):
-    """Each component has an 8x8 matrix of u8 entries = 64 bytes."""
-    br.skip_bytes(num_comps * 64)
+    """Each component has an 8x8 matrix of u8 entries = 64 bytes = 512 bits.
+    These are read as contiguous u8 bitfield entries with NO byte-alignment
+    padding before them (they follow directly after the use_q_matrix flag bit
+    inside the same bitfield).  Must use read_bits, not skip_bytes."""
+    br.read_bits(num_comps * 64 * 8)
 
 
 # ---------------------------------------------------------------------------
